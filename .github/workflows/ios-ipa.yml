@@ -1,0 +1,83 @@
+name: Build iOS IPA
+
+# iOS binaries can only be compiled on macOS, so the build runs in the cloud
+# and produces an UNSIGNED .ipa. Sideloadly (or AltStore) signs it locally
+# with your Apple ID afterwards — see the repo README for the handoff steps.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+
+# macOS minutes are the scarce resource on a GitHub CI budget, so never let
+# two builds of the same commit race each other.
+concurrency:
+  group: ios-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build unsigned IPA
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Report toolchain
+        run: flutter --version
+
+      - name: Fetch packages
+        run: flutter pub get
+
+      - name: Lint
+        run: flutter analyze --no-fatal-infos
+
+      - name: Write LiveKit config
+        env:
+          LIVEKIT_SANDBOX_ID: ${{ secrets.LIVEKIT_SANDBOX_ID }}
+          LIVEKIT_AGENT_NAME: ${{ secrets.LIVEKIT_AGENT_NAME }}
+        run: |
+          set -euo pipefail
+          if [ -z "$LIVEKIT_SANDBOX_ID" ]; then
+            echo "::error::LIVEKIT_SANDBOX_ID is not set. Without it the app silently falls back to LiveKit's homepage agent instead of yours."
+            exit 1
+          fi
+          printf 'LIVEKIT_SANDBOX_ID=%s\nLIVEKIT_AGENT_NAME=%s\n' \
+            "$LIVEKIT_SANDBOX_ID" "${LIVEKIT_AGENT_NAME:-}" > assets/.env
+          # These are a dev token-server id and an agent name, not secrets.
+          echo "baked into the app bundle:"
+          cat assets/.env
+
+      - name: Build iOS (unsigned)
+        run: flutter build ios --release --no-codesign
+
+      - name: Package IPA
+        run: |
+          set -euo pipefail
+          mkdir -p Payload
+          cp -R build/ios/iphoneos/Runner.app Payload/
+          zip -qry Runner.ipa Payload
+          ls -lh Runner.ipa
+          # Guard against a silent rename regression: the home-screen label
+          # and mic permission string must both be present in the binary.
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' Payload/Runner.app/Info.plist
+          /usr/libexec/PlistBuddy -c 'Print :NSMicrophoneUsageDescription' Payload/Runner.app/Info.plist
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: jarvis-unsigned-ipa
+          path: Runner.ipa
+          if-no-files-found: error
+          retention-days: 14
